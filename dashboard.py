@@ -1,23 +1,91 @@
 #!/usr/bin/env python3
-"""KEDA Demo Dashboard -- real-time TUI using Rich."""
+"""KEDA Demo Dashboard -- robust real-time TUI using Rich.
 
-# === Auto-install rich if missing ===
+This version keeps the testable functions from the original file, but fixes a few
+practical issues that make the dashboard look unreliable during a live demo:
+
+- kubectl failures are surfaced in the UI instead of being silently swallowed;
+- LPUSH uses one redis-cli call with multiple jobs, instead of 10/100 kubectl execs;
+- the HPA parser accepts both `kubectl get hpa -o json` list output and a single HPA;
+- styles are preserved in panels by rendering Rich objects directly;
+- namespace, labels, Redis deployment, HPA name and queue key are configurable;
+- the dashboard can run without the alternate screen by default, which is easier
+  during teaching/demos.
+"""
+
+from __future__ import annotations
+
+# Keep the demo script self-contained, but avoid hiding installation failures.
 try:
     import rich  # noqa: F401
-except ImportError:
+except ImportError:  # pragma: no cover - depends on target environment
     import subprocess as _sp
     import sys as _sys
-    _sp.run([_sys.executable, "-m", "pip", "install", "rich", "-q"])
 
+    install = _sp.run(
+        [_sys.executable, "-m", "pip", "install", "rich", "-q"],
+        capture_output=True,
+        text=True,
+    )
+    if install.returncode != 0:
+        print("Rich is required. Install it with: python -m pip install rich", file=_sys.stderr)
+        print(install.stderr, file=_sys.stderr)
+        raise
+
+import argparse
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
 import time
 import uuid
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
+
+CONFIG: dict[str, Any] = {
+    "namespace": os.getenv("KEDA_DASHBOARD_NAMESPACE", "default"),
+    "redis_deploy": os.getenv("KEDA_DASHBOARD_REDIS_DEPLOY", "redis"),
+    "queue_key": os.getenv("KEDA_DASHBOARD_QUEUE_KEY", "keda:queue"),
+    "worker_label": os.getenv("KEDA_DASHBOARD_WORKER_LABEL", "app=worker"),
+    "worker_name": os.getenv("KEDA_DASHBOARD_WORKER_NAME", "worker"),
+    "hpa_name": os.getenv("KEDA_DASHBOARD_HPA", ""),
+    "interval": float(os.getenv("KEDA_DASHBOARD_INTERVAL", "1.0")),
+    "max_pods": int(os.getenv("KEDA_DASHBOARD_MAX_PODS", "6")),
+    "max_log_lines": int(os.getenv("KEDA_DASHBOARD_MAX_LOG_LINES", "6")),
+    "max_errors": int(os.getenv("KEDA_DASHBOARD_MAX_ERRORS", "3")),
+    "ascii_boxes": os.getenv("KEDA_DASHBOARD_ASCII", "1") not in ("0", "false", "False", "no"),
+}
+
+
+@dataclass
+class CommandResult:
+    """Result of a kubectl invocation."""
+
+    command: list[str]
+    stdout: str = ""
+    stderr: str = ""
+    returncode: int = 1
+    timed_out: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0 and not self.timed_out
+
+    def short_error(self) -> str:
+        if self.timed_out:
+            return "timeout"
+        text = (self.stderr or self.stdout or "command failed").strip()
+        return text.splitlines()[-1] if text else "command failed"
 
 
 # ============================================================
@@ -43,18 +111,24 @@ def parse_pods(json_str):
         data = json.loads(json_str)
     except (json.JSONDecodeError, ValueError):
         return []
+
     pods = []
     for item in data.get("items", []):
         meta = item.get("metadata", {})
         status = item.get("status", {})
-        ready = False
-        for cs in status.get("containerStatuses") or []:
-            if cs.get("ready"):
-                ready = True
+        container_statuses = status.get("containerStatuses") or []
+        ready_count = sum(1 for cs in container_statuses if cs.get("ready"))
+        total_count = len(container_statuses)
+        restart_count = sum(int(cs.get("restartCount", 0) or 0) for cs in container_statuses)
+        creation_ts = meta.get("creationTimestamp")
         pods.append({
             "name": meta.get("name", "?"),
             "status": status.get("phase", "Unknown"),
-            "ready": ready,
+            "ready": ready_count > 0 if total_count else False,
+            "ready_count": ready_count,
+            "total_count": total_count,
+            "restarts": restart_count,
+            "age": _human_age(creation_ts),
         })
     return pods
 
@@ -70,17 +144,27 @@ def detect_scale(old_count, new_count):
 
 
 def build_lpush_command(n):
-    """Return a list of redis-cli LPUSH command strings, one per job."""
+    """Return a list of redis-cli LPUSH command strings, one per job.
+
+    Kept for compatibility with the existing tests. The live dashboard uses the
+    more efficient `build_bulk_lpush_command` below.
+    """
     return [_redis_lpush(job_id=str(uuid.uuid4())[:8]) for _ in range(n)]
 
 
 def _redis_lpush(job_id):
-    return f"redis-cli LPUSH keda:queue job:{job_id}"
+    return f"redis-cli LPUSH {CONFIG['queue_key']} job:{job_id}"
+
+
+def build_bulk_lpush_command(n):
+    """Return a single redis-cli LPUSH command with n job values."""
+    values = [f"job:{uuid.uuid4().hex[:12]}" for _ in range(max(0, int(n)))]
+    return ["redis-cli", "LPUSH", CONFIG["queue_key"], *values]
 
 
 def build_drain_command():
     """Return the redis-cli command to delete the queue."""
-    return "redis-cli DEL keda:queue"
+    return f"redis-cli DEL {CONFIG['queue_key']}"
 
 
 def render_queue_bar(depth, max_visible=100, bar_width=20):
@@ -90,13 +174,17 @@ def render_queue_bar(depth, max_visible=100, bar_width=20):
     """
     from rich.text import Text
 
+    try:
+        depth = max(0, int(depth))
+    except (TypeError, ValueError):
+        depth = 0
+
     ratio = min(depth / max_visible, 1.0) if max_visible > 0 else 0
     filled_width = ratio * bar_width
     full_blocks = int(filled_width)
     partial = filled_width - full_blocks
 
-    bar = ""
-    bar += "█" * full_blocks
+    bar = "█" * full_blocks
 
     if partial > 0 and full_blocks < bar_width:
         idx = min(int(partial * 8), 7)
@@ -111,21 +199,37 @@ def render_queue_bar(depth, max_visible=100, bar_width=20):
     return Text.assemble((bar, style), "  ", (str(depth), "bold cyan"))
 
 
-def parse_hpa(json_str):
-    """Parse kubectl get hpa -o json into a dict, or None."""
+def parse_hpa(json_str, target_name=None):
+    """Parse kubectl HPA JSON into a dict, or None.
+
+    Accepts both list output from `kubectl get hpa -o json` and single-object
+    output from `kubectl get hpa NAME -o json`.
+    """
     if not json_str:
         return None
     try:
         data = json.loads(json_str)
     except (json.JSONDecodeError, ValueError):
         return None
-    items = data.get("items", [])
-    if not items:
+
+    if "items" in data:
+        items = data.get("items", [])
+        if not items:
+            return None
+        item = _select_hpa(items, target_name)
+    else:
+        item = data
+
+    if not item:
         return None
-    item = items[0]
+
+    meta = item.get("metadata", {})
     spec = item.get("spec", {})
     status = item.get("status", {})
+    target = spec.get("scaleTargetRef", {}) or {}
     return {
+        "name": meta.get("name", "?"),
+        "target": target.get("name", "?"),
         "current": status.get("currentReplicas", 0),
         "desired": status.get("desiredReplicas", 0),
         "min": spec.get("minReplicas", 0),
@@ -133,74 +237,176 @@ def parse_hpa(json_str):
     }
 
 
+def _select_hpa(items, target_name=None):
+    if target_name:
+        for item in items:
+            spec = item.get("spec", {})
+            meta = item.get("metadata", {})
+            if spec.get("scaleTargetRef", {}).get("name") == target_name:
+                return item
+            if target_name in meta.get("name", ""):
+                return item
+    return items[0] if items else None
+
+
+def _human_age(creation_timestamp):
+    if not creation_timestamp:
+        return "—"
+    try:
+        created = datetime.fromisoformat(creation_timestamp.replace("Z", "+00:00"))
+        delta = datetime.now(timezone.utc) - created
+    except Exception:
+        return "—"
+
+    seconds = max(0, int(delta.total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h"
+    return f"{hours // 24}d"
+
+
 # ============================================================
 # Data Collection (subprocess wrappers)
 # ============================================================
 
 
-def _run_kubectl(args, timeout=5):
-    """Run a kubectl command and return stdout, or empty string on error."""
+def _kubectl_cmd(args):
+    return ["kubectl", "-n", CONFIG["namespace"], *args]
+
+
+def _run_kubectl_result(args, timeout=5):
+    """Run kubectl and return a CommandResult with stdout, stderr and status."""
+    command = _kubectl_cmd(args)
+    if shutil.which("kubectl") is None:
+        return CommandResult(command=command, stderr="kubectl not found in PATH", returncode=127)
     try:
         result = subprocess.run(
-            ["kubectl", "-n", "default"] + args,
+            command,
             capture_output=True,
             text=True,
             timeout=timeout,
         )
-        return result.stdout
-    except Exception:
-        return ""
+        return CommandResult(
+            command=command,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            returncode=result.returncode,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return CommandResult(
+            command=command,
+            stdout=exc.stdout or "",
+            stderr=exc.stderr or "",
+            returncode=124,
+            timed_out=True,
+        )
+    except Exception as exc:  # pragma: no cover - defensive guard for demo use
+        return CommandResult(command=command, stderr=str(exc), returncode=1)
+
+
+def _run_kubectl(args, timeout=5):
+    """Run a kubectl command and return stdout, or empty string on error.
+
+    Compatibility wrapper kept for existing tests / callers.
+    """
+    result = _run_kubectl_result(args, timeout=timeout)
+    return result.stdout if result.ok else ""
 
 
 def _run_kubectl_ok(args, timeout=5):
-    """Run kubectl, return (stdout, True) or ("", False)."""
-    try:
-        result = subprocess.run(
-            ["kubectl", "-n", "default"] + args,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        return result.stdout, result.returncode == 0
-    except Exception:
-        return "", False
+    """Run kubectl, return (stdout, True) or (diagnostic, False)."""
+    result = _run_kubectl_result(args, timeout=timeout)
+    return (result.stdout if result.ok else result.short_error(), result.ok)
 
 
 def get_queue_depth():
     """Query Redis for the current queue depth."""
-    out = _run_kubectl([
-        "exec", "deploy/redis", "--",
-        "redis-cli", "LLEN", "keda:queue",
-    ])
-    return parse_queue_depth(out)
+    result = _run_kubectl_result([
+        "exec", f"deploy/{CONFIG['redis_deploy']}", "--",
+        "redis-cli", "LLEN", CONFIG["queue_key"],
+    ], timeout=4)
+    return parse_queue_depth(result.stdout) if result.ok else 0
 
 
 def get_pods():
     """Fetch worker pod list from the cluster."""
-    out = _run_kubectl([
-        "get", "pods", "-l", "app=worker", "-o", "json",
-    ])
-    return parse_pods(out)
+    result = _run_kubectl_result([
+        "get", "pods", "-l", CONFIG["worker_label"], "-o", "json",
+    ], timeout=5)
+    return parse_pods(result.stdout) if result.ok else []
 
 
 def get_hpa_info():
     """Fetch HPA info for the worker scaled object."""
-    out = _run_kubectl([
-        "get", "hpa", "-o", "json",
-    ])
-    return parse_hpa(out)
+    if CONFIG.get("hpa_name"):
+        args = ["get", "hpa", CONFIG["hpa_name"], "-o", "json"]
+    else:
+        args = ["get", "hpa", "-o", "json"]
+    result = _run_kubectl_result(args, timeout=5)
+    return parse_hpa(result.stdout, target_name=CONFIG.get("worker_name")) if result.ok else None
+
+
+def collect_snapshot():
+    """Collect all live metrics and return (snapshot, errors)."""
+    errors = []
+
+    redis_result = _run_kubectl_result([
+        "exec", f"deploy/{CONFIG['redis_deploy']}", "--",
+        "redis-cli", "LLEN", CONFIG["queue_key"],
+    ], timeout=4)
+    queue_depth = parse_queue_depth(redis_result.stdout) if redis_result.ok else 0
+    if not redis_result.ok:
+        errors.append(f"Redis: {redis_result.short_error()}")
+
+    pods_result = _run_kubectl_result([
+        "get", "pods", "-l", CONFIG["worker_label"], "-o", "json",
+    ], timeout=5)
+    pods = parse_pods(pods_result.stdout) if pods_result.ok else []
+    if not pods_result.ok:
+        errors.append(f"Pods: {pods_result.short_error()}")
+
+    if CONFIG.get("hpa_name"):
+        hpa_args = ["get", "hpa", CONFIG["hpa_name"], "-o", "json"]
+    else:
+        hpa_args = ["get", "hpa", "-o", "json"]
+    hpa_result = _run_kubectl_result(hpa_args, timeout=5)
+    hpa = parse_hpa(hpa_result.stdout, target_name=CONFIG.get("worker_name")) if hpa_result.ok else None
+    if not hpa_result.ok:
+        errors.append(f"HPA: {hpa_result.short_error()}")
+
+    snapshot = {
+        "connected": redis_result.ok and pods_result.ok,
+        "queue_depth": queue_depth,
+        "pods": pods,
+        "hpa_info": hpa,
+        "last_update": datetime.now().strftime("%H:%M:%S"),
+    }
+    return snapshot, errors
 
 
 def push_jobs(n):
-    """Push n job items onto the Redis queue (one kubectl exec per job)."""
-    for cmd in build_lpush_command(n):
-        _run_kubectl(["exec", "deploy/redis", "--"] + cmd.split(), timeout=10)
+    """Push n job items onto the Redis queue using one kubectl exec."""
+    cmd = build_bulk_lpush_command(n)
+    if len(cmd) <= 3:
+        return False, "no jobs to push"
+    result = _run_kubectl_result([
+        "exec", f"deploy/{CONFIG['redis_deploy']}", "--", *cmd,
+    ], timeout=15)
+    return result.ok, result.short_error() if not result.ok else f"pushed {n} jobs"
 
 
 def drain_queue():
     """Delete the entire queue from Redis."""
-    cmd = build_drain_command()
-    _run_kubectl(["exec", "deploy/redis", "--"] + cmd.split())
+    result = _run_kubectl_result([
+        "exec", f"deploy/{CONFIG['redis_deploy']}", "--",
+        "redis-cli", "DEL", CONFIG["queue_key"],
+    ], timeout=10)
+    return result.ok, result.short_error() if not result.ok else "queue drained"
 
 
 # ============================================================
@@ -208,165 +414,261 @@ def drain_queue():
 # ============================================================
 
 
+def _panel_box():
+    """Return a terminal-safe box style for panels."""
+    from rich import box
+
+    return box.ASCII if CONFIG.get("ascii_boxes", True) else box.ROUNDED
+
+
+def _bounded(value, default, minimum=1):
+    """Parse positive integer UI bounds from config/CLI."""
+    try:
+        return max(minimum, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
 def add_log(state, style, message):
     """Append a timestamped message to the rolling activity log (max 20)."""
     ts = datetime.now().strftime("%H:%M:%S")
-    state["log"].append((style, f"[{ts}] {message}"))
+    state.setdefault("log", []).append((style, f"[{ts}] {message}"))
     if len(state["log"]) > 20:
         state["log"] = state["log"][-20:]
 
 
 def _build_header(state):
-    """Build the header panel."""
+    """Build a compact one-line header."""
     from rich.panel import Panel
     from rich.text import Text
 
     connected = state.get("connected", False)
-    dot = "[bold green]●[/]" if connected else "[bold red]○[/]"
+    dot_style = "bold green" if connected else "bold red"
     status_text = "Connected" if connected else "Disconnected"
-
     header = Text.assemble(
-        (dot, ""),
+        ("●", dot_style),
         "  ",
-        ("KEDA Dashboard", "bold white"),
-        "  ",
-        (f"({status_text})", "dim"),
+        ("KEDA / Redis queue scaling demo", "bold"),
+        "   ",
+        (status_text, "dim"),
+        "   ",
+        (f"ns={CONFIG['namespace']}", "dim"),
+        "   ",
+        (f"selector={CONFIG['worker_label']}", "dim"),
+        "   ",
+        (f"updated={state.get('last_update', '—')}", "dim"),
     )
-    return Panel(header, style="on blue", height=3)
+    return Panel(header, border_style="blue", padding=(0, 1), box=_panel_box(), height=3)
+
+
+def _mini_metric(label, value, style="bold"):
+    from rich.text import Text
+    t = Text()
+    t.append(label + "\n", style="dim")
+    t.append(str(value), style=style)
+    return t
+
+
+def _build_status_panel(state):
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.table import Table
+
+    pods = state.get("pods", [])
+    hpa = state.get("hpa_info")
+    table = Table.grid(expand=True)
+    table.add_column(ratio=1)
+    table.add_column(ratio=1)
+    table.add_column(ratio=1)
+    table.add_row(
+        _mini_metric("QUEUE", state.get("queue_depth", 0), "bold cyan"),
+        _mini_metric("WORKERS", len(pods), "bold blue"),
+        _mini_metric("SCALE EVENTS", state.get("scale_events", 0), "bold yellow"),
+    )
+
+    hpa_line = "HPA: not found"
+    if hpa:
+        hpa_line = (
+            f"HPA {hpa.get('name', '—')}: "
+            f"current={hpa['current']} desired={hpa['desired']} "
+            f"range={hpa['min']}→{hpa['max']}"
+        )
+    return Panel(Group(table, hpa_line), title="Status", border_style="cyan", padding=(0, 1), box=_panel_box(), height=6)
 
 
 def _build_queue_panel(state):
-    """Build the queue depth panel."""
+    from rich.console import Group
     from rich.panel import Panel
     from rich.text import Text
 
     depth = state.get("queue_depth", 0)
-    scale_events = state.get("scale_events", 0)
-
-    bar = render_queue_bar(depth)
-    content = [bar]
-
-    # Scale banner
+    items = [render_queue_bar(depth, max_visible=100, bar_width=28)]
     banner = state.get("scale_event_banner")
     if banner:
-        content.append(Text(""))
-        content.append(Text(banner, style="bold yellow"))
-
-    content.append(Text(""))
-    content.append(Text(f"Scale Events: {scale_events}", style="bold"))
-
-    # HPA info
-    hpa = state.get("hpa_info")
-    if hpa:
-        content.append(Text(""))
-        content.append(Text(
-            f"HPA: {hpa['current']}/{hpa['min']}→{hpa['max']} "
-            f"(desired: {hpa['desired']})",
-            style="dim",
-        ))
-
-    return Panel(
-        "\n".join(str(c) for c in content),
-        title="[bold cyan]Queue[/]",
-        border_style="cyan",
-    )
+        items.append(Text(banner, style="bold yellow"))
+    else:
+        items.append(Text("", style="dim"))
+    items.append(Text(f"key={CONFIG['queue_key']}", style="dim"))
+    items.append(Text(f"redis=deploy/{CONFIG['redis_deploy']}", style="dim"))
+    return Panel(Group(*items), title="Redis queue", border_style="cyan", padding=(0, 1), box=_panel_box(), height=6)
 
 
 def _build_pod_panel(state):
-    """Build the pod status panel."""
+    """Build a pod status table with a fixed vertical footprint.
+
+    Rich panels do not provide an internal scroll area in a normal terminal.
+    To prevent the dashboard from growing as Kubernetes creates more pods, this
+    function shows only the first N pods and adds a summary row for hidden pods.
+    """
     from rich.panel import Panel
     from rich.table import Table
 
-    table = Table(box=None, expand=True)
-    table.add_column("Name", style="cyan", no_wrap=True)
-    table.add_column("Status")
-    table.add_column("Ready")
-
     pods = state.get("pods", [])
-    for pod in pods:
+    max_pods = _bounded(CONFIG.get("max_pods"), default=6)
+    visible = pods[:max_pods]
+    hidden = max(0, len(pods) - len(visible))
+
+    table = Table(box=None, expand=True, show_header=True, header_style="bold")
+    table.add_column("Pod", style="cyan", no_wrap=False, overflow="fold", ratio=3)
+    table.add_column("Phase", ratio=1)
+    table.add_column("Ready", ratio=1)
+    table.add_column("Restarts", justify="right", ratio=1)
+    table.add_column("Age", justify="right", ratio=1)
+
+    for pod in visible:
         status_style = "green" if pod["status"] == "Running" else "yellow"
         ready_style = "green" if pod["ready"] else "red"
+        ready_text = (
+            f"{pod.get('ready_count', 0)}/{pod.get('total_count', 0)}"
+            if pod.get("total_count")
+            else "No"
+        )
         table.add_row(
             pod["name"],
             f"[{status_style}]{pod['status']}[/]",
-            f"[{ready_style}]{'Yes' if pod['ready'] else 'No'}[/]",
+            f"[{ready_style}]{ready_text}[/]",
+            str(pod.get("restarts", 0)),
+            pod.get("age", "—"),
+        )
+
+    if hidden:
+        table.add_row(
+            f"[dim]… {hidden} more pod(s) hidden; use --max-pods to show more[/]",
+            "[dim]—[/]",
+            "[dim]—[/]",
+            "[dim]—[/]",
+            "[dim]—[/]",
         )
 
     if not pods:
         table.add_row(
-            "[dim]—[/]", "[dim]no pods[/]", "[dim]—[/]"
+            f"[dim]No pods match selector {CONFIG['worker_label']}[/]",
+            "[dim]—[/]",
+            "[dim]—[/]",
+            "[dim]—[/]",
+            "[dim]—[/]",
         )
 
+    # header + visible rows + optional hidden row, plus borders/padding
+    panel_height = max_pods + 5
     return Panel(
         table,
-        title=f"[bold blue]Pods[/] ({len(pods)})",
+        title=f"Worker pods ({len(pods)})",
         border_style="blue",
+        padding=(0, 1),
+        box=_panel_box(),
+        height=panel_height,
     )
 
 
 def _build_log_panel(state):
-    """Build the activity log panel."""
+    """Build a fixed-height rolling activity log."""
     from rich.panel import Panel
     from rich.text import Text
 
+    max_lines = _bounded(CONFIG.get("max_log_lines"), default=6)
     log_text = Text()
-    for style, msg in state.get("log", []):
+    entries = state.get("log", [])[-max_lines:]
+    for style, msg in entries:
         log_text.append(f"{msg}\n", style=style)
-
+    if not entries:
+        log_text.append("No activity yet\n", style="dim")
     return Panel(
         log_text,
-        title="[bold green]Activity[/]",
+        title=f"Activity (last {max_lines})",
         border_style="green",
+        padding=(0, 1),
+        box=_panel_box(),
+        height=max_lines + 3,
     )
 
 
-def _build_footer(_state):
-    """Build the footer panel."""
+def _build_error_panel(state):
     from rich.panel import Panel
     from rich.text import Text
 
-    footer = Text.assemble(
-        (" [1] ", "bold white on dark_blue"),
-        ("+10 jobs", ""),
-        "  ",
-        (" [2] ", "bold white on dark_blue"),
-        ("+100 jobs", ""),
-        "  ",
-        (" [3] ", "bold white on dark_blue"),
-        ("Drain", ""),
-        "  ",
-        (" [q] ", "bold white on dark_red"),
-        ("Quit", ""),
+    max_errors = _bounded(CONFIG.get("max_errors"), default=3)
+    errors = state.get("errors", [])[-max_errors:]
+    text = Text()
+    if errors:
+        for err in errors:
+            text.append(f"• {err}\n", style="red")
+    else:
+        text.append("No collection errors", style="dim")
+    return Panel(
+        text,
+        title="Diagnostics",
+        border_style="red" if errors else "grey50",
+        padding=(0, 1),
+        box=_panel_box(),
+        height=6,
     )
-    return Panel(footer, style="on grey23")
+
+
+def _build_controls_panel(state):
+    from rich.panel import Panel
+    from rich.text import Text
+
+    controls = Text.assemble(
+        (" [1] ", "bold white on dark_blue"),
+        " +10 jobs   ",
+        (" [2] ", "bold white on dark_blue"),
+        " +100 jobs   ",
+        (" [3] ", "bold white on dark_blue"),
+        " drain queue   ",
+        (" [q] ", "bold white on dark_red"),
+        " quit",
+    )
+    if not state.get("keyboard_enabled", True):
+        controls.append("   keyboard not available", style="red")
+    return Panel(controls, border_style="grey50", padding=(0, 1), box=_panel_box(), height=3)
 
 
 def render(state):
-    """Build the full Rich Layout for the current state."""
-    from rich.layout import Layout
+    """Build a compact, bounded-height dashboard.
 
-    layout = Layout()
-    layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="main"),
-        Layout(name="footer", size=3),
-    )
-    layout["main"].split_row(
-        Layout(name="left", ratio=2),
-        Layout(name="right", ratio=3),
-    )
-    layout["right"].split_column(
-        Layout(name="pods", ratio=3),
-        Layout(name="log", ratio=2),
-    )
+    Normal terminal UIs do not have true scrolling inside a box. The dashboard
+    therefore keeps each section bounded and shows rolling/truncated content.
+    """
+    from rich.columns import Columns
+    from rich.console import Group
 
-    layout["header"].update(_build_header(state))
-    layout["left"].update(_build_queue_panel(state))
-    layout["pods"].update(_build_pod_panel(state))
-    layout["log"].update(_build_log_panel(state))
-    layout["footer"].update(_build_footer(state))
-
-    return layout
+    top = Columns(
+        [
+            _build_status_panel(state),
+            _build_queue_panel(state),
+            _build_error_panel(state),
+        ],
+        equal=True,
+        expand=True,
+    )
+    return Group(
+        _build_header(state),
+        top,
+        _build_pod_panel(state),
+        _build_log_panel(state),
+        _build_controls_panel(state),
+    )
 
 
 # ============================================================
@@ -376,34 +678,46 @@ def render(state):
 
 def _keyboard_reader(action_queue, state):
     """Background thread: read single keys from stdin, push to action_queue."""
-    import tty
-    import termios
+    if not sys.stdin.isatty():
+        state["keyboard_enabled"] = False
+        return
+
     import atexit
+    import termios
+    import tty
 
     fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
+    try:
+        old = termios.tcgetattr(fd)
+    except Exception:
+        state["keyboard_enabled"] = False
+        return
 
     def restore():
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass
 
     atexit.register(restore)
+    state["keyboard_enabled"] = True
 
     try:
         tty.setraw(fd)
         while not state.get("quit"):
             ch = sys.stdin.read(1)
             if ch == "1":
-                action_queue.put("push10")
+                action_queue.put(("push", 10))
             elif ch == "2":
-                action_queue.put("push100")
+                action_queue.put(("push", 100))
             elif ch == "3":
-                action_queue.put("drain")
+                action_queue.put(("drain", None))
             elif ch in ("q", "Q", "\x03"):
                 state["quit"] = True
-                action_queue.put("quit")
+                action_queue.put(("quit", None))
                 break
     except Exception:
-        pass
+        state["keyboard_enabled"] = False
     finally:
         restore()
 
@@ -411,20 +725,17 @@ def _keyboard_reader(action_queue, state):
 def _background_worker(action_queue, log_queue):
     """Background thread: process long-running actions, report via log_queue."""
     while True:
-        action = action_queue.get()
+        action, value = action_queue.get()
         if action == "quit":
             break
         try:
-            if action == "push10":
-                push_jobs(10)
-                log_queue.put(("magenta", "Pushed 10 jobs to queue"))
-            elif action == "push100":
-                push_jobs(100)
-                log_queue.put(("magenta", "Pushed 100 jobs to queue"))
+            if action == "push":
+                ok, msg = push_jobs(value)
+                log_queue.put(("magenta" if ok else "red", msg))
             elif action == "drain":
-                drain_queue()
-                log_queue.put(("magenta", "Queue drained"))
-        except Exception as exc:
+                ok, msg = drain_queue()
+                log_queue.put(("magenta" if ok else "red", msg))
+        except Exception as exc:  # pragma: no cover - defensive guard for demo use
             log_queue.put(("red", f"Error: {exc}"))
 
 
@@ -433,12 +744,43 @@ def _background_worker(action_queue, log_queue):
 # ============================================================
 
 
-def main():
-    """Entry point: run the Live dashboard loop."""
-    from rich.live import Live
-    from rich.console import Console
+def _build_arg_parser():
+    parser = argparse.ArgumentParser(description="KEDA Redis queue demo dashboard")
+    parser.add_argument("--namespace", default=CONFIG["namespace"])
+    parser.add_argument("--redis-deploy", default=CONFIG["redis_deploy"])
+    parser.add_argument("--queue-key", default=CONFIG["queue_key"])
+    parser.add_argument("--worker-label", default=CONFIG["worker_label"])
+    parser.add_argument("--worker-name", default=CONFIG["worker_name"], help="Deployment/scale target name used to select the HPA")
+    parser.add_argument("--hpa-name", default=CONFIG["hpa_name"], help="Optional explicit HPA name")
+    parser.add_argument("--interval", type=float, default=CONFIG["interval"])
+    parser.add_argument("--screen", action="store_true", help="Use Rich alternate screen mode")
+    parser.add_argument("--max-pods", type=int, default=CONFIG["max_pods"], help="Maximum pod rows shown inside the dashboard")
+    parser.add_argument("--max-log-lines", type=int, default=CONFIG["max_log_lines"], help="Maximum activity log rows shown inside the dashboard")
+    parser.add_argument("--unicode-boxes", action="store_true", help="Use Unicode borders instead of terminal-safe ASCII borders")
+    parser.add_argument("--once", action="store_true", help="Collect once, render once, and exit")
+    return parser
 
-    state: dict = {
+
+def main(argv=None):
+    """Entry point: run the Live dashboard loop."""
+    from rich.console import Console
+    from rich.live import Live
+
+    args = _build_arg_parser().parse_args(argv)
+    CONFIG.update({
+        "namespace": args.namespace,
+        "redis_deploy": args.redis_deploy,
+        "queue_key": args.queue_key,
+        "worker_label": args.worker_label,
+        "worker_name": args.worker_name,
+        "hpa_name": args.hpa_name,
+        "interval": max(0.25, args.interval),
+        "max_pods": max(1, args.max_pods),
+        "max_log_lines": max(1, args.max_log_lines),
+        "ascii_boxes": not args.unicode_boxes,
+    })
+
+    state: dict[str, Any] = {
         "queue_depth": 0,
         "pods": [],
         "hpa_info": None,
@@ -447,31 +789,39 @@ def main():
         "scale_event_banner": None,
         "scale_event_banner_ttl": 0,
         "log": [],
+        "errors": [],
         "connected": False,
         "quit": False,
+        "keyboard_enabled": False,
+        "last_update": "—",
     }
 
-    action_queue = queue.Queue()
-    log_queue = queue.Queue()
+    action_queue: queue.Queue = queue.Queue()
+    log_queue: queue.Queue = queue.Queue()
 
     add_log(state, "green", "Dashboard started")
+    add_log(state, "dim", f"Using selector: {CONFIG['worker_label']}")
 
-    # Start keyboard listener
+    if args.once:
+        snapshot, errors = collect_snapshot()
+        state.update(snapshot)
+        state["errors"] = errors
+        Console().print(render(state))
+        return 0 if not errors else 1
+
     kbd_thread = threading.Thread(
         target=_keyboard_reader, args=(action_queue, state), daemon=True,
     )
     kbd_thread.start()
 
-    # Start background worker for push/drain
     worker_thread = threading.Thread(
         target=_background_worker, args=(action_queue, log_queue), daemon=True,
     )
     worker_thread.start()
 
     try:
-        with Live(refresh_per_second=4, screen=True) as live:
+        with Live(render(state), refresh_per_second=4, screen=args.screen) as live:
             while not state["quit"]:
-                # Drain log messages from background worker
                 try:
                     while True:
                         style, msg = log_queue.get_nowait()
@@ -479,45 +829,43 @@ def main():
                 except queue.Empty:
                     pass
 
-                # Collect metrics
-                try:
-                    depth_out, ok = _run_kubectl_ok([
-                        "exec", "deploy/redis", "--",
-                        "redis-cli", "LLEN", "keda:queue",
-                    ], timeout=3)
-                    state["connected"] = ok
-                    state["queue_depth"] = parse_queue_depth(depth_out)
+                snapshot, errors = collect_snapshot()
+                state.update(snapshot)
+                state["errors"] = errors
+                for err in errors:
+                    # Avoid logging the same repeated collection error every tick.
+                    if not state["log"] or err not in state["log"][-1][1]:
+                        add_log(state, "red", err)
 
-                    state["pods"] = get_pods()
-                    state["hpa_info"] = get_hpa_info()
-
-                    new_count = len(state["pods"])
-                    event = detect_scale(state["prev_pod_count"], new_count)
-                    if event:
+                new_count = len(state["pods"])
+                event = detect_scale(state["prev_pod_count"], new_count)
+                if event:
+                    # Do not count the initial pod count as a scale event.
+                    if state["prev_pod_count"] is not None:
                         state["scale_events"] += 1
-                        state["scale_event_banner"] = event
-                        state["scale_event_banner_ttl"] = 16  # ~4 sec at 250ms
-                        add_log(state, "yellow", event)
-                    state["prev_pod_count"] = new_count
-                except Exception as exc:
-                    state["connected"] = False
-                    add_log(state, "red", f"Data error: {exc}")
+                    state["scale_event_banner"] = event
+                    state["scale_event_banner_ttl"] = max(2, int(4 / CONFIG["interval"]))
+                    add_log(state, "yellow", event)
+                state["prev_pod_count"] = new_count
 
-                # Decay scale banner
                 if state.get("scale_event_banner_ttl", 0) > 0:
                     state["scale_event_banner_ttl"] -= 1
                 else:
                     state["scale_event_banner"] = None
 
-                # Render
                 live.update(render(state))
-                time.sleep(0.25)
+                time.sleep(CONFIG["interval"])
 
     except KeyboardInterrupt:
         state["quit"] = True
     finally:
+        try:
+            action_queue.put(("quit", None))
+        except Exception:
+            pass
         Console().print("[green]Dashboard stopped.[/]")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
