@@ -450,13 +450,13 @@ def _build_header(state):
     if hpa:
         hpa_text = f"{hpa.get('current', 'na')}->{hpa.get('desired', 'na')}"
     error_count = len(state.get("errors", []))
-    status_text = "ok" if connected and error_count == 0 else f"{error_count}err"
+    status_text = "ok" if connected and error_count == 0 else "degraded"
     header = Text.assemble(
         ("●", dot_style),
         "  ",
-        (f"conn={connection}", "bold"),
+        (f"connection={connection}", "bold"),
         "   ",
-        (f"q={state.get('queue_depth', 0)}", "cyan"),
+        (f"queue={state.get('queue_depth', 0)}", "cyan"),
         "   ",
         (f"pods={len(pods)}", "blue"),
         "   ",
