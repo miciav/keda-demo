@@ -13,6 +13,6 @@ spec:
   triggers:
     - type: redis
       metadata:
-        address: redis:6379
+        address: redis.default.svc.cluster.local:6379
         listName: keda:queue
         listLength: "5"

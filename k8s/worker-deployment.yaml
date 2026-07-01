@@ -19,16 +19,15 @@ spec:
           env:
             - name: REDIS_HOST
               value: redis
-          command:
-            - /bin/sh
-            - -c
+          command: ["/bin/sh", "-c"]
+          args:
             - |
-              pip install redis -q && python -u -c "
-import os, redis, random, time
-r = redis.Redis(host=os.environ['REDIS_HOST'])
-while True:
-    msg = r.brpop('keda:queue', timeout=1)
-    if msg:
-        time.sleep(random.uniform(0.5, 3.0))
-        print('processed')
-"
+              pip install redis -q && python -u << 'PYEOF'
+              import os, redis, random, time
+              r = redis.Redis(host=os.environ['REDIS_HOST'])
+              while True:
+                  msg = r.brpop('keda:queue', timeout=1)
+                  if msg:
+                      time.sleep(random.uniform(0.5, 3.0))
+                      print('processed')
+              PYEOF
