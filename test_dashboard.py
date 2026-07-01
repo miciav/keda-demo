@@ -187,5 +187,100 @@ class TestJobProducer(unittest.TestCase):
         self.assertIn("keda:queue", cmd)
 
 
+class TestQueueBarRenderer(unittest.TestCase):
+    """6. render_queue_bar: unicode block bar rendering."""
+
+    def setUp(self):
+        from dashboard import render_queue_bar
+        self.render_bar = render_queue_bar
+
+    def test_empty_queue(self):
+        bar = self.render_bar(0)
+        # All empty blocks, no fill
+        self.assertIn("░", str(bar))
+        self.assertNotIn("█", str(bar))
+
+    def test_partial_fill(self):
+        bar = self.render_bar(50, max_visible=100, bar_width=20)
+        text = str(bar)
+        # ~50% filled
+        self.assertIn("█", text)
+        self.assertIn("50", text)
+
+    def test_full_queue(self):
+        bar = self.render_bar(100)
+        text = str(bar)
+        self.assertIn("100", text)
+
+    def test_clamped_queue(self):
+        bar = self.render_bar(150, max_visible=100, bar_width=20)
+        text = str(bar)
+        self.assertIn("150", text)
+
+    def test_custom_bar_width(self):
+        bar = self.render_bar(10, max_visible=100, bar_width=10)
+        # Bar renders without error
+        self.assertIsNotNone(bar)
+
+
+class TestHPAParser(unittest.TestCase):
+    """7. parse_hpa: parse kubectl get hpa JSON."""
+
+    def setUp(self):
+        from dashboard import parse_hpa
+        self.parse = parse_hpa
+
+    def test_valid_hpa(self):
+        hpa_json = json.dumps({
+            "items": [{
+                "metadata": {"name": "keda-hpa-worker"},
+                "spec": {"minReplicas": 1, "maxReplicas": 10},
+                "status": {"currentReplicas": 3, "desiredReplicas": 5}
+            }]
+        })
+        hpa = self.parse(hpa_json)
+        self.assertIsNotNone(hpa)
+        self.assertEqual(hpa["min"], 1)
+        self.assertEqual(hpa["max"], 10)
+        self.assertEqual(hpa["current"], 3)
+        self.assertEqual(hpa["desired"], 5)
+
+    def test_no_items(self):
+        hpa = self.parse(json.dumps({"items": []}))
+        self.assertIsNone(hpa)
+
+    def test_invalid_json(self):
+        hpa = self.parse("not json")
+        self.assertIsNone(hpa)
+
+    def test_empty_input(self):
+        hpa = self.parse("")
+        self.assertIsNone(hpa)
+
+
+class TestAddLog(unittest.TestCase):
+    """8. add_log: timestamped log entries."""
+
+    def setUp(self):
+        from dashboard import add_log
+        self.add_log = add_log
+
+    def test_log_has_timestamp(self):
+        state = {"log": []}
+        self.add_log(state, "green", "Test message")
+        self.assertEqual(len(state["log"]), 1)
+        style, msg = state["log"][0]
+        self.assertEqual(style, "green")
+        self.assertIn("Test message", msg)
+        self.assertRegex(msg, r"\[\d{2}:\d{2}:\d{2}\]")
+
+    def test_log_rolling_buffer(self):
+        state = {"log": []}
+        for i in range(25):
+            self.add_log(state, "green", f"Msg {i}")
+        self.assertEqual(len(state["log"]), 20)
+        self.assertIn("Msg 24", state["log"][-1][1])
+
+
 if __name__ == "__main__":
     unittest.main()
