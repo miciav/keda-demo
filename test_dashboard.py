@@ -325,6 +325,21 @@ class TestDashboardLayout(unittest.TestCase):
         self.assertEqual("Activity (last 6)", activity_panel.title)
         self.assertIn("Redis: timeout", str(activity_panel.renderable))
 
+    def test_header_degrades_when_errors_present(self):
+        state = {
+            "connected": True,
+            "queue_depth": 12,
+            "pods": [],
+            "errors": ["HPA: timeout"],
+            "last_update": "12:34:56",
+        }
+        import dashboard
+
+        header_panel = dashboard._build_header(state)
+
+        self.assertIn("status=degraded", header_panel.renderable.plain)
+        self.assertEqual("bold red", header_panel.renderable.spans[0].style)
+
     def test_activity_panel_prioritizes_current_errors_within_max_lines(self):
         state = {
             "log": [
@@ -345,6 +360,21 @@ class TestDashboardLayout(unittest.TestCase):
         self.assertIn("Redis: timeout", text)
         self.assertIn("Pods: timeout", text)
         self.assertNotIn("msg 0", text)
+
+    def test_activity_panel_shows_hidden_error_summary_when_capacity_is_exceeded(self):
+        import dashboard
+
+        old = dashboard.CONFIG["max_log_lines"]
+        dashboard.CONFIG["max_log_lines"] = 1
+        try:
+            activity_panel = dashboard._build_log_panel({
+                "errors": ["Redis: timeout", "Pods: timeout", "HPA: timeout"],
+            })
+        finally:
+            dashboard.CONFIG["max_log_lines"] = old
+
+        text = str(activity_panel.renderable)
+        self.assertIn("3 active errors", text)
 
     def test_queue_panel_shows_keyboard_unavailable_state(self):
         from rich.console import Console
@@ -377,13 +407,17 @@ class TestDashboardLayout(unittest.TestCase):
         import dashboard
 
         activity_panel = dashboard._build_log_panel(state)
-        console = Console(record=True, width=50)
-        console.print(activity_panel)
-        text = console.export_text()
+        narrow = Console(record=True, width=50)
+        narrow.print(activity_panel)
+        narrow_text = narrow.export_text()
+        wide = Console(record=True, width=100)
+        wide.print(activity_panel)
+        wide_text = wide.export_text()
 
-        self.assertIn("ERR1", text)
-        self.assertIn("ERR2", text)
-        self.assertIn("…", text)
+        self.assertIn("ERR1", narrow_text)
+        self.assertIn("ERR2", narrow_text)
+        self.assertIn("…", narrow_text)
+        self.assertIn("would otherwise wrap across rows", wide_text)
 
 
 class TestAddLog(unittest.TestCase):

@@ -442,14 +442,14 @@ def _build_header(state):
     from rich.text import Text
 
     connected = state.get("connected", False)
-    dot_style = "bold green" if connected else "bold red"
+    error_count = len(state.get("errors", []))
+    dot_style = "bold green" if connected and error_count == 0 else "bold red"
     connection = "up" if connected else "down"
     pods = state.get("pods", [])
     hpa = state.get("hpa_info") or {}
     hpa_text = "na"
     if hpa:
         hpa_text = f"{hpa.get('current', 'na')}->{hpa.get('desired', 'na')}"
-    error_count = len(state.get("errors", []))
     status_text = "ok" if connected and error_count == 0 else "degraded"
     header = Text.assemble(
         ("●", dot_style),
@@ -568,22 +568,29 @@ def _build_log_panel(state):
     from rich.panel import Panel
     from rich.text import Text
 
-    def clip(line, limit=40):
-        if len(line) <= limit:
-            return line
-        return line[: limit - 1] + "…"
-
     max_lines = _bounded(CONFIG.get("max_log_lines"), default=6)
-    log_text = Text()
+    log_text = Text("", no_wrap=True, overflow="ellipsis")
     entries = state.get("log", [])
-    error_rows = [("red", err) for err in state.get("errors", [])[-max_lines:]]
+    errors = state.get("errors", [])
+
+    if len(errors) > max_lines:
+        if max_lines == 1:
+            error_rows = [("red", f"{len(errors)} active errors")]
+        else:
+            visible_errors = errors[-(max_lines - 1):]
+            hidden_count = len(errors) - len(visible_errors)
+            error_rows = [("red", f"+{hidden_count} more active errors")]
+            error_rows.extend(("red", err) for err in visible_errors)
+    else:
+        error_rows = [("red", err) for err in errors]
+
     if not entries and not error_rows:
         log_text.append("No activity yet\n", style="dim")
     else:
         log_slots = max(0, max_lines - len(error_rows))
         rows = entries[-log_slots:] + error_rows if log_slots else error_rows[-max_lines:]
         for style, msg in rows[-max_lines:]:
-            log_text.append(f"{clip(msg)}\n", style=style)
+            log_text.append(f"{msg}\n", style=style)
     return Panel(
         log_text,
         title=f"Activity (last {max_lines})",
