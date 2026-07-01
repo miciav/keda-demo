@@ -668,17 +668,13 @@ def render(state):
     Normal terminal UIs do not have true scrolling inside a box. The dashboard
     therefore keeps each section bounded and shows rolling/truncated content.
     """
-    from rich.columns import Columns
     from rich.console import Group
+    from rich.table import Table
 
-    main = Columns(
-        [
-            _build_queue_panel(state),
-            _build_pod_panel(state),
-        ],
-        equal=True,
-        expand=True,
-    )
+    main = Table.grid(expand=True)
+    main.add_column(ratio=2)
+    main.add_column(ratio=1)
+    main.add_row(_build_queue_panel(state), _build_pod_panel(state))
     return Group(
         _build_header(state),
         main,
