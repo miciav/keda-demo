@@ -568,6 +568,11 @@ def _build_log_panel(state):
     from rich.panel import Panel
     from rich.text import Text
 
+    def clip(line, limit=40):
+        if len(line) <= limit:
+            return line
+        return line[: limit - 1] + "…"
+
     max_lines = _bounded(CONFIG.get("max_log_lines"), default=6)
     log_text = Text()
     entries = state.get("log", [])
@@ -578,7 +583,7 @@ def _build_log_panel(state):
         log_slots = max(0, max_lines - len(error_rows))
         rows = entries[-log_slots:] + error_rows if log_slots else error_rows[-max_lines:]
         for style, msg in rows[-max_lines:]:
-            log_text.append(f"{msg}\n", style=style)
+            log_text.append(f"{clip(msg)}\n", style=style)
     return Panel(
         log_text,
         title=f"Activity (last {max_lines})",

@@ -360,6 +360,31 @@ class TestDashboardLayout(unittest.TestCase):
 
         self.assertIn("kbd unavailable", console.export_text())
 
+    def test_activity_panel_truncates_long_errors_at_narrow_width(self):
+        from rich.console import Console
+        state = {
+            "log": [
+                ("dim", "[10:00:00] msg 0"),
+                ("dim", "[10:00:01] msg 1"),
+                ("dim", "[10:00:02] msg 2"),
+                ("dim", "[10:00:03] msg 3"),
+            ],
+            "errors": [
+                "ERR1 this is a very long redis timeout message that would otherwise wrap across rows",
+                "ERR2 this is another very long pod timeout message that must remain visible",
+            ],
+        }
+        import dashboard
+
+        activity_panel = dashboard._build_log_panel(state)
+        console = Console(record=True, width=50)
+        console.print(activity_panel)
+        text = console.export_text()
+
+        self.assertIn("ERR1", text)
+        self.assertIn("ERR2", text)
+        self.assertIn("…", text)
+
 
 class TestAddLog(unittest.TestCase):
     """8. add_log: timestamped log entries."""
