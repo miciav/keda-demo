@@ -325,6 +325,41 @@ class TestDashboardLayout(unittest.TestCase):
         self.assertEqual("Activity (last 6)", activity_panel.title)
         self.assertIn("Redis: timeout", str(activity_panel.renderable))
 
+    def test_activity_panel_prioritizes_current_errors_within_max_lines(self):
+        state = {
+            "log": [
+                ("dim", "[10:00:00] msg 0"),
+                ("dim", "[10:00:01] msg 1"),
+                ("dim", "[10:00:02] msg 2"),
+                ("dim", "[10:00:03] msg 3"),
+                ("dim", "[10:00:04] msg 4"),
+                ("dim", "[10:00:05] msg 5"),
+            ],
+            "errors": ["Redis: timeout", "Pods: timeout"],
+        }
+        import dashboard
+
+        activity_panel = dashboard._build_log_panel(state)
+        text = str(activity_panel.renderable)
+
+        self.assertIn("Redis: timeout", text)
+        self.assertIn("Pods: timeout", text)
+        self.assertNotIn("msg 0", text)
+
+    def test_queue_panel_shows_keyboard_unavailable_state(self):
+        from rich.console import Console
+        state = {
+            "queue_depth": 0,
+            "keyboard_enabled": False,
+        }
+        import dashboard
+
+        queue_panel = dashboard._build_queue_panel(state)
+        console = Console(record=True, width=120)
+        console.print(queue_panel)
+
+        self.assertIn("kbd unavailable", console.export_text())
+
 
 class TestAddLog(unittest.TestCase):
     """8. add_log: timestamped log entries."""

@@ -62,7 +62,6 @@ CONFIG: dict[str, Any] = {
     "interval": float(os.getenv("KEDA_DASHBOARD_INTERVAL", "1.0")),
     "max_pods": int(os.getenv("KEDA_DASHBOARD_MAX_PODS", "6")),
     "max_log_lines": int(os.getenv("KEDA_DASHBOARD_MAX_LOG_LINES", "6")),
-    "max_errors": int(os.getenv("KEDA_DASHBOARD_MAX_ERRORS", "3")),
     "ascii_boxes": os.getenv("KEDA_DASHBOARD_ASCII", "1") not in ("0", "false", "False", "no"),
 }
 
@@ -472,41 +471,6 @@ def _build_header(state):
     return Panel(header, border_style="blue", padding=(0, 1), box=_panel_box(), height=3)
 
 
-def _mini_metric(label, value, style="bold"):
-    from rich.text import Text
-    t = Text()
-    t.append(label + "\n", style="dim")
-    t.append(str(value), style=style)
-    return t
-
-
-def _build_status_panel(state):
-    from rich.console import Group
-    from rich.panel import Panel
-    from rich.table import Table
-
-    pods = state.get("pods", [])
-    hpa = state.get("hpa_info")
-    table = Table.grid(expand=True)
-    table.add_column(ratio=1)
-    table.add_column(ratio=1)
-    table.add_column(ratio=1)
-    table.add_row(
-        _mini_metric("QUEUE", state.get("queue_depth", 0), "bold cyan"),
-        _mini_metric("WORKERS", len(pods), "bold blue"),
-        _mini_metric("SCALE EVENTS", state.get("scale_events", 0), "bold yellow"),
-    )
-
-    hpa_line = "HPA: not found"
-    if hpa:
-        hpa_line = (
-            f"HPA {hpa.get('name', '—')}: "
-            f"current={hpa['current']} desired={hpa['desired']} "
-            f"range={hpa['min']}→{hpa['max']}"
-        )
-    return Panel(Group(table, hpa_line), title="Status", border_style="cyan", padding=(0, 1), box=_panel_box(), height=6)
-
-
 def _build_queue_panel(state):
     from rich.console import Group
     from rich.panel import Panel
@@ -519,7 +483,10 @@ def _build_queue_panel(state):
         items.append(Text(banner, style="bold yellow"))
     else:
         items.append(Text("No recent scale event", style="dim"))
-    items.append(Text("1 +10   2 +100   3 drain   q quit", style="dim"))
+    shortcuts = "1 +10   2 +100   3 drain   q quit"
+    if not state.get("keyboard_enabled", True):
+        shortcuts += "   kbd unavailable"
+    items.append(Text(shortcuts, style="dim"))
     items.append(Text(f"key={CONFIG['queue_key']}", style="dim"))
     items.append(Text(f"redis=deploy/{CONFIG['redis_deploy']}", style="dim"))
     return Panel(
@@ -603,14 +570,15 @@ def _build_log_panel(state):
 
     max_lines = _bounded(CONFIG.get("max_log_lines"), default=6)
     log_text = Text()
-    entries = state.get("log", [])[-max_lines:]
-    errors = state.get("errors", [])
-    for style, msg in entries:
-        log_text.append(f"{msg}\n", style=style)
-    for err in errors:
-        log_text.append(f"{err}\n", style="red")
-    if not entries and not errors:
+    entries = state.get("log", [])
+    error_rows = [("red", err) for err in state.get("errors", [])[-max_lines:]]
+    if not entries and not error_rows:
         log_text.append("No activity yet\n", style="dim")
+    else:
+        log_slots = max(0, max_lines - len(error_rows))
+        rows = entries[-log_slots:] + error_rows if log_slots else error_rows[-max_lines:]
+        for style, msg in rows[-max_lines:]:
+            log_text.append(f"{msg}\n", style=style)
     return Panel(
         log_text,
         title=f"Activity (last {max_lines})",
@@ -619,47 +587,6 @@ def _build_log_panel(state):
         box=_panel_box(),
         height=max_lines + 3,
     )
-
-
-def _build_error_panel(state):
-    from rich.panel import Panel
-    from rich.text import Text
-
-    max_errors = _bounded(CONFIG.get("max_errors"), default=3)
-    errors = state.get("errors", [])[-max_errors:]
-    text = Text()
-    if errors:
-        for err in errors:
-            text.append(f"• {err}\n", style="red")
-    else:
-        text.append("No collection errors", style="dim")
-    return Panel(
-        text,
-        title="Diagnostics",
-        border_style="red" if errors else "grey50",
-        padding=(0, 1),
-        box=_panel_box(),
-        height=6,
-    )
-
-
-def _build_controls_panel(state):
-    from rich.panel import Panel
-    from rich.text import Text
-
-    controls = Text.assemble(
-        (" [1] ", "bold white on dark_blue"),
-        " +10 jobs   ",
-        (" [2] ", "bold white on dark_blue"),
-        " +100 jobs   ",
-        (" [3] ", "bold white on dark_blue"),
-        " drain queue   ",
-        (" [q] ", "bold white on dark_red"),
-        " quit",
-    )
-    if not state.get("keyboard_enabled", True):
-        controls.append("   keyboard not available", style="red")
-    return Panel(controls, border_style="grey50", padding=(0, 1), box=_panel_box(), height=3)
 
 
 def render(state):
@@ -843,10 +770,6 @@ def main(argv=None):
                 snapshot, errors = collect_snapshot()
                 state.update(snapshot)
                 state["errors"] = errors
-                for err in errors:
-                    # Avoid logging the same repeated collection error every tick.
-                    if not state["log"] or err not in state["log"][-1][1]:
-                        add_log(state, "red", err)
 
                 new_count = len(state["pods"])
                 event = detect_scale(state["prev_pod_count"], new_count)
