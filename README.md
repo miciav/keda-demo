@@ -1,41 +1,41 @@
 # KEDA Demo — Redis Queue Autoscaler
 
-Laboratorio didattico su KEDA + Minikube per il corso Kubernetes Lab (studenti magistrali).
+Teaching lab on KEDA + Minikube for the Kubernetes Lab course (graduate students).
 
-Mostra l'autoscaling event-driven con KEDA: una coda Redis cresce, KEDA rileva la profondità e scala i worker da 0 a N. Quando la coda si svuota, scala giù fino a 0.
+Demonstrates event-driven autoscaling with KEDA: a Redis queue grows, KEDA detects the depth and scales workers from 0 to N. When the queue drains, it scales back down to 0.
 
-## Architettura
+## Architecture
 
 ```
 Minikube
-├── Redis (1 pod) — coda FIFO (LPUSH/BRPOP)
-├── Worker (deployment, 0→N repliche) — consuma job
-├── KEDA (Helm) — ScaledObject su Redis list length
-└── Producer — TUI che inietta job
+├── Redis (1 pod) — FIFO queue (LPUSH/BRPOP)
+├── Worker (deployment, 0→N replicas) — consumes jobs
+├── KEDA (Helm) — ScaledObject on Redis list length
+└── Producer — TUI that injects jobs
 
-Locale (fuori cluster)
-└── dashboard.py — TUI con Rich: coda, pod, log, azioni
+Local (outside cluster)
+└── dashboard.py — Rich-based TUI: queue, pods, log, actions
 ```
 
-## Utilizzo
+## Usage
 
 ```bash
-./01-setup-minikube.sh    # avvia Minikube
-./02-setup-keda.sh        # installa KEDA via Helm
-./03-setup-app.sh         # deploya Redis + Worker + ScaledObject
-python3 dashboard.py      # avvia la TUI
+./01-setup-minikube.sh    # start Minikube
+./02-setup-keda.sh        # install KEDA via Helm
+./03-setup-app.sh         # deploy Redis + Worker + ScaledObject
+python3 dashboard.py      # launch the TUI
 ```
 
-Tasti: `1` +10 job, `2` +100 job, `3` drain coda, `q` quit.
+Keys: `1` +10 jobs, `2` +100 jobs, `3` drain queue, `q` quit.
 
-## Requisiti
+## Requirements
 
-- Minikube (o qualsiasi cluster Kubernetes)
+- Minikube (or any Kubernetes cluster)
 - Helm 3
 - kubectl
-- Python 3.9+ (dipendenza unica: `rich`, auto-installata)
+- Python 3.9+ (single dependency: `rich`, auto-installed)
 
-## Riferimenti
+## References
 
 - [KEDA — Kubernetes Event-driven Autoscaling](https://keda.sh)
 - [KEDA Redis Lists scaler](https://keda.sh/docs/latest/scalers/redis-lists/)
@@ -43,4 +43,4 @@ Tasti: `1` +10 job, `2` +100 job, `3` drain coda, `q` quit.
 
 ---
 
-Progetto originale per uso didattico. I pattern KEDA + Redis seguono la documentazione ufficiale e gli esempi pubblici del progetto KEDA.
+Original project for educational use. KEDA + Redis patterns follow the official documentation and public examples from the KEDA project.
