@@ -444,19 +444,30 @@ def _build_header(state):
 
     connected = state.get("connected", False)
     dot_style = "bold green" if connected else "bold red"
-    status_text = "Connected" if connected else "Disconnected"
+    connection = "up" if connected else "down"
+    pods = state.get("pods", [])
+    hpa = state.get("hpa_info") or {}
+    hpa_text = "na"
+    if hpa:
+        hpa_text = f"{hpa.get('current', 'na')}->{hpa.get('desired', 'na')}"
+    error_count = len(state.get("errors", []))
+    status_text = "ok" if connected and error_count == 0 else f"{error_count}err"
     header = Text.assemble(
         ("●", dot_style),
         "  ",
-        ("KEDA / Redis queue scaling demo", "bold"),
+        (f"conn={connection}", "bold"),
         "   ",
-        (status_text, "dim"),
+        (f"q={state.get('queue_depth', 0)}", "cyan"),
+        "   ",
+        (f"pods={len(pods)}", "blue"),
+        "   ",
+        (f"hpa={hpa_text}", "magenta"),
         "   ",
         (f"ns={CONFIG['namespace']}", "dim"),
         "   ",
-        (f"selector={CONFIG['worker_label']}", "dim"),
-        "   ",
         (f"updated={state.get('last_update', '—')}", "dim"),
+        "   ",
+        (f"status={status_text}", "dim"),
     )
     return Panel(header, border_style="blue", padding=(0, 1), box=_panel_box(), height=3)
 
@@ -507,10 +518,18 @@ def _build_queue_panel(state):
     if banner:
         items.append(Text(banner, style="bold yellow"))
     else:
-        items.append(Text("", style="dim"))
+        items.append(Text("No recent scale event", style="dim"))
+    items.append(Text("1 +10   2 +100   3 drain   q quit", style="dim"))
     items.append(Text(f"key={CONFIG['queue_key']}", style="dim"))
     items.append(Text(f"redis=deploy/{CONFIG['redis_deploy']}", style="dim"))
-    return Panel(Group(*items), title="Redis queue", border_style="cyan", padding=(0, 1), box=_panel_box(), height=6)
+    return Panel(
+        Group(*items),
+        title="Queue + Actions",
+        border_style="cyan",
+        padding=(0, 1),
+        box=_panel_box(),
+        height=8,
+    )
 
 
 def _build_pod_panel(state):
@@ -532,7 +551,6 @@ def _build_pod_panel(state):
     table.add_column("Pod", style="cyan", no_wrap=False, overflow="fold", ratio=3)
     table.add_column("Phase", ratio=1)
     table.add_column("Ready", ratio=1)
-    table.add_column("Restarts", justify="right", ratio=1)
     table.add_column("Age", justify="right", ratio=1)
 
     for pod in visible:
@@ -547,14 +565,12 @@ def _build_pod_panel(state):
             pod["name"],
             f"[{status_style}]{pod['status']}[/]",
             f"[{ready_style}]{ready_text}[/]",
-            str(pod.get("restarts", 0)),
             pod.get("age", "—"),
         )
 
     if hidden:
         table.add_row(
             f"[dim]… {hidden} more pod(s) hidden; use --max-pods to show more[/]",
-            "[dim]—[/]",
             "[dim]—[/]",
             "[dim]—[/]",
             "[dim]—[/]",
@@ -566,14 +582,13 @@ def _build_pod_panel(state):
             "[dim]—[/]",
             "[dim]—[/]",
             "[dim]—[/]",
-            "[dim]—[/]",
         )
 
     # header + visible rows + optional hidden row, plus borders/padding
     panel_height = max_pods + 5
     return Panel(
         table,
-        title=f"Worker pods ({len(pods)})",
+        title=f"Workers ({len(pods)})",
         border_style="blue",
         padding=(0, 1),
         box=_panel_box(),
@@ -589,9 +604,12 @@ def _build_log_panel(state):
     max_lines = _bounded(CONFIG.get("max_log_lines"), default=6)
     log_text = Text()
     entries = state.get("log", [])[-max_lines:]
+    errors = state.get("errors", [])
     for style, msg in entries:
         log_text.append(f"{msg}\n", style=style)
-    if not entries:
+    for err in errors:
+        log_text.append(f"{err}\n", style="red")
+    if not entries and not errors:
         log_text.append("No activity yet\n", style="dim")
     return Panel(
         log_text,
@@ -653,21 +671,18 @@ def render(state):
     from rich.columns import Columns
     from rich.console import Group
 
-    top = Columns(
+    main = Columns(
         [
-            _build_status_panel(state),
             _build_queue_panel(state),
-            _build_error_panel(state),
+            _build_pod_panel(state),
         ],
         equal=True,
         expand=True,
     )
     return Group(
         _build_header(state),
-        top,
-        _build_pod_panel(state),
+        main,
         _build_log_panel(state),
-        _build_controls_panel(state),
     )
 
 

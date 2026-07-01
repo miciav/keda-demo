@@ -2,7 +2,6 @@
 
 import json
 import unittest
-from unittest.mock import patch, MagicMock
 
 
 class TestDashboardImports(unittest.TestCase):
@@ -256,6 +255,75 @@ class TestHPAParser(unittest.TestCase):
     def test_empty_input(self):
         hpa = self.parse("")
         self.assertIsNone(hpa)
+
+
+class TestDashboardLayout(unittest.TestCase):
+    def _render_text(self, state):
+        from rich.console import Console
+        import dashboard
+
+        console = Console(record=True, width=120)
+        console.print(dashboard.render(state))
+        return console.export_text()
+
+    def test_render_uses_compact_operations_first_layout(self):
+        text = self._render_text({
+            "connected": True,
+            "queue_depth": 12,
+            "pods": [
+                {
+                    "name": "worker-1",
+                    "status": "Running",
+                    "ready": True,
+                    "ready_count": 1,
+                    "total_count": 1,
+                    "restarts": 0,
+                    "age": "3m",
+                }
+            ],
+            "hpa_info": {
+                "name": "keda-hpa-worker",
+                "current": 1,
+                "desired": 2,
+                "min": 1,
+                "max": 10,
+            },
+            "log": [("green", "[10:00:00] scale event")],
+            "errors": ["Redis: timeout"],
+            "last_update": "12:34:56",
+            "scale_events": 1,
+        })
+        self.assertIn("Queue + Actions", text)
+        self.assertIn("Workers (1)", text)
+        self.assertNotIn("Status", text)
+        self.assertNotIn("Diagnostics", text)
+        self.assertNotIn("+10 jobs", text)
+
+    def test_activity_panel_includes_current_errors(self):
+        state = {
+            "connected": True,
+            "queue_depth": 0,
+            "pods": [
+                {
+                    "name": "worker-1",
+                    "status": "Running",
+                    "ready": True,
+                    "ready_count": 1,
+                    "total_count": 1,
+                    "restarts": 0,
+                    "age": "3m",
+                }
+            ],
+            "log": [("green", "[10:00:00] scaled up")],
+            "errors": ["Redis: timeout"],
+            "last_update": "12:34:56",
+        }
+        import dashboard
+
+        activity_panel = dashboard._build_log_panel(state)
+
+        self.assertEqual("Activity (last 6)", activity_panel.title)
+        self.assertIn("Redis: timeout", str(activity_panel.renderable))
 
 
 class TestAddLog(unittest.TestCase):
